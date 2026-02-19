@@ -443,29 +443,26 @@ def _auto_start_server(server_url: str):
     parsed = urlparse(server_url)
     port = parsed.port or HTTP_PORT
 
+    topic = NTFY_TOPIC or _generate_topic()
     script_path = os.path.abspath(__file__).replace("\\", "/")
+    log_file = os.path.join(os.path.expanduser("~"), ".claude-ntfy-hook.log")
     cmd = [
         sys.executable, script_path, "server",
         "--port", str(port),
-        "--topic", NTFY_TOPIC or _generate_topic(),
+        "--topic", topic,
         "--ntfy-server", NTFY_SERVER,
     ]
 
-    # Detach the server so it outlives this hook invocation
+    # Spawn the server in its own visible terminal window
     if IS_WINDOWS:
-        CREATE_NEW_PROCESS_GROUP = 0x00000200
-        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_CONSOLE = 0x00000010
         subprocess.Popen(
             cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            creationflags=CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS,
+            creationflags=CREATE_NEW_CONSOLE,
         )
     else:
         subprocess.Popen(
             cmd,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
             start_new_session=True,
         )
 
@@ -473,7 +470,8 @@ def _auto_start_server(server_url: str):
     for _ in range(10):
         time.sleep(0.5)
         if _server_is_running(server_url):
-            log.info("Auto-started server")
+            msg = f"Auto-started server\n  topic: {topic}\n  log:   {log_file}"
+            print(msg, file=sys.stderr)
             return
 
     print("Warning: server did not start in time", file=sys.stderr)
@@ -528,6 +526,11 @@ def run_server(args):
     ts_ip = get_tailscale_ip()
     base_url = f"http://{ts_ip}:{args.port}"
     ActionHandler.base_url = base_url
+
+    # Persist topic to a file for easy reference
+    topic_file = os.path.join(os.path.expanduser("~"), ".claude-ntfy-hook-topic")
+    with open(topic_file, "w") as f:
+        f.write(NTFY_TOPIC)
 
     log.info("=" * 60)
     log.info("Claude Code Notification Server")
