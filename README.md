@@ -13,8 +13,11 @@ Claude Code ──hook──> claude-notify.py --hook ──> server ──> ntf
 ## What You Get
 
 - **Allow/Deny from your phone** — tap a button on a push notification to approve or block a tool call
+- **Accept plans remotely** — tap "Accept Plan" to approve Claude's plan from your phone (Windows)
 - **Smart filtering** — reads your Claude Code `ask`/`allow`/`deny` rules, only bothers you when it matters
+- **Context-aware notifications** — parses the Claude transcript to show actual question text, plan details, and tool previews instead of generic messages
 - **Zero setup server** — auto-starts in its own terminal window the first time a hook fires
+- **Reliable delivery** — retries failed notifications with exponential backoff (handles ntfy outages, network blips, rate limits)
 - **Rich notifications** — markdown-formatted previews of commands, file paths, and diffs
 - **Stop notifications** — get pinged when Claude finishes with a summary of what it said
 - **Cross-platform** — Windows, macOS, and Linux
@@ -98,6 +101,8 @@ Use Claude Code normally. The server auto-starts when needed — you don't have 
 | What happens | What you see on your phone |
 |---|---|
 | Claude wants to run `rm -rf /tmp/foo` | Push notification with **Allow** / **Deny** buttons |
+| Claude asks a question | The actual question text and options |
+| Claude has a plan for approval | Plan summary with an **Accept Plan** button |
 | Claude finishes a task | Summary of its last message |
 | Claude is waiting for input | Notification that it needs attention |
 
@@ -136,12 +141,15 @@ uv run claude-notify.py server [OPTIONS]
 ## How It Works
 
 1. Claude Code fires a hook (PreToolUse, Notification, or Stop)
-2. The hook script checks if the server is running — auto-starts it if not
-3. Posts the event to the server over your Tailscale network
-4. For tools in your `ask` list: sends an ntfy push with Allow/Deny action buttons and blocks
-5. You tap a button on your phone — ntfy POSTs back to the server over Tailscale
-6. Server unblocks, hook exits with code 0 (allow) or 2 (block)
-7. Claude Code proceeds or stops accordingly
+2. The hook script checks if the server is running — auto-starts it if not (with file locking to prevent races)
+3. For Notification hooks, the script reads the Claude transcript to extract context (question text, plan details, last assistant message)
+4. Posts the event to the server over your Tailscale network
+5. For tools in your `ask` list: sends an ntfy push with Allow/Deny action buttons and blocks
+6. You tap a button on your phone — ntfy POSTs back to the server over Tailscale
+7. Server unblocks, hook exits with code 0 (allow) or 2 (block)
+8. Claude Code proceeds or stops accordingly
+
+If ntfy is temporarily unavailable, notifications are retried up to 3 times with exponential backoff (1s, 3s) before giving up.
 
 ## License
 
