@@ -43,13 +43,22 @@ IS_WINDOWS = platform.system() == "Windows"
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
-NTFY_TOPIC = "claude-notify-CHANGE-ME"
+NTFY_TOPIC = None  # Auto-generated if not provided
 NTFY_SERVER = "https://ntfy.sh"
 HTTP_PORT = 8787
 TAILSCALE_IP = None  # Auto-detect if None
 PERMISSION_TIMEOUT = 300  # seconds to wait for remote allow/deny
 
 import fnmatch as _fnmatch
+import hashlib
+
+
+def _generate_topic() -> str:
+    """Generate a unique topic based on machine username and hostname."""
+    seed = f"{os.getenv('USERNAME', os.getenv('USER', 'unknown'))}@{platform.node()}"
+    suffix = hashlib.sha256(seed.encode()).hexdigest()[:12]
+    return f"claude-ntfy-hook-{suffix}"
+
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -438,7 +447,7 @@ def _auto_start_server(server_url: str):
     cmd = [
         sys.executable, script_path, "server",
         "--port", str(port),
-        "--topic", NTFY_TOPIC,
+        "--topic", NTFY_TOPIC or _generate_topic(),
         "--ntfy-server", NTFY_SERVER,
     ]
 
@@ -601,7 +610,8 @@ def main():
 
     # Server mode (default)
     srv = sub.add_parser("server", help="Run the notification server")
-    srv.add_argument("--topic", default=NTFY_TOPIC, help="ntfy topic")
+    default_topic = NTFY_TOPIC or _generate_topic()
+    srv.add_argument("--topic", default=default_topic, help=f"ntfy topic (default: {default_topic})")
     srv.add_argument("--port", type=int, default=HTTP_PORT, help="HTTP port")
     srv.add_argument("--ntfy-server", default=NTFY_SERVER, help="ntfy server URL")
     srv.add_argument("--ts-ip", default=None, help="Tailscale IP override")
@@ -618,7 +628,7 @@ def main():
         run_as_hook(args.hook, args.server)
     elif args.mode == "server" or args.mode is None:
         # Default to server mode — fill in defaults when no subcommand given
-        args.topic = getattr(args, "topic", NTFY_TOPIC)
+        args.topic = getattr(args, "topic", None) or _generate_topic()
         args.port = getattr(args, "port", HTTP_PORT)
         args.ntfy_server = getattr(args, "ntfy_server", NTFY_SERVER)
         args.ts_ip = getattr(args, "ts_ip", None)
