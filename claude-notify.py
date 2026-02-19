@@ -31,15 +31,98 @@ import subprocess
 import argparse
 import logging
 import threading
+import contextlib
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
-from datetime import datetime
 import platform
-import re
+import fnmatch as _fnmatch
+import hashlib
 
 import requests
 
 IS_WINDOWS = platform.system() == "Windows"
+
+
+# ─── Terminal PID Discovery (Windows) ────────────────────────────────────────
+
+_TERMINAL_EXES = frozenset({
+    "mintty.exe", "windowsterminal.exe", "cmd.exe",
+    "powershell.exe", "pwsh.exe", "conhost.exe",
+    "alacritty.exe", "wezterm-gui.exe",
+})
+
+
+def _find_terminal_pid():
+    """Walk up the process tree to find the terminal hosting this process.
+
+    Uses the Toolhelp32 snapshot API via ctypes. Returns the PID of the
+    first ancestor whose exe name is a known terminal, or None.
+    Windows-only; returns None on other platforms.
+    """
+    if not IS_WINDOWS:
+        return None
+
+    import ctypes
+    from ctypes import wintypes
+
+    TH32CS_SNAPPROCESS = 0x00000002
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.POINTER(ctypes.c_ulong)),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", ctypes.c_wchar * 260),
+        ]
+
+    kernel32 = ctypes.windll.kernel32
+    CreateToolhelp32Snapshot = kernel32.CreateToolhelp32Snapshot
+    Process32FirstW = kernel32.Process32FirstW
+    Process32NextW = kernel32.Process32NextW
+    CloseHandle = kernel32.CloseHandle
+
+    try:
+        snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+        if snap == -1:
+            return None
+
+        entry = PROCESSENTRY32W()
+        entry.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+
+        # Build pid -> (parent_pid, exe_name) map
+        proc_map = {}
+        if Process32FirstW(snap, ctypes.byref(entry)):
+            proc_map[entry.th32ProcessID] = (
+                entry.th32ParentProcessID,
+                entry.szExeFile.lower(),
+            )
+            while Process32NextW(snap, ctypes.byref(entry)):
+                proc_map[entry.th32ProcessID] = (
+                    entry.th32ParentProcessID,
+                    entry.szExeFile.lower(),
+                )
+        CloseHandle(snap)
+
+        # Walk up from our PID
+        pid = os.getpid()
+        visited = set()
+        while pid in proc_map and pid not in visited:
+            visited.add(pid)
+            parent_pid, exe = proc_map[pid]
+            if exe in _TERMINAL_EXES:
+                return pid
+            pid = parent_pid
+
+        return None
+    except Exception:
+        return None
+
 
 # ─── Configuration ────────────────────────────────────────────────────────────
 
@@ -48,10 +131,6 @@ NTFY_SERVER = "https://ntfy.sh"
 HTTP_PORT = 8787
 TAILSCALE_IP = None  # Auto-detect if None
 PERMISSION_TIMEOUT = 300  # seconds to wait for remote allow/deny
-
-import fnmatch as _fnmatch
-import hashlib
-
 
 def _generate_topic() -> str:
     """Generate a unique topic based on machine username and hostname."""
@@ -105,16 +184,38 @@ def send_notification(title, message, actions=None, priority="default", tags="",
             parts.append(s)
         headers["Actions"] = "; ".join(parts)
 
-    try:
-        requests.post(
-            f"{NTFY_SERVER}/{NTFY_TOPIC}",
-            data=message.encode("utf-8"),
-            headers=headers,
-            timeout=10,
-        )
-        log.info(f"Sent: {title}")
-    except Exception as e:
-        log.error(f"Notification failed: {e}")
+    max_attempts = 3
+    backoff_delays = [1, 3]  # seconds between retries
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = requests.post(
+                f"{NTFY_SERVER}/{NTFY_TOPIC}",
+                data=message.encode("utf-8"),
+                headers=headers,
+                timeout=10,
+            )
+            # Don't retry on success or client errors (except 429)
+            if resp.status_code < 400 or (400 <= resp.status_code < 500 and resp.status_code != 429):
+                log.info(f"Sent: {title}")
+                return
+            # 5xx or 429: worth retrying
+            if attempt < max_attempts:
+                delay = backoff_delays[attempt - 1]
+                log.warning(f"Notification got {resp.status_code}, retrying in {delay}s (attempt {attempt}/{max_attempts})")
+                time.sleep(delay)
+            else:
+                log.error(f"Notification failed after {max_attempts} attempts: HTTP {resp.status_code}")
+        except (requests.ConnectionError, requests.Timeout) as e:
+            if attempt < max_attempts:
+                delay = backoff_delays[attempt - 1]
+                log.warning(f"Notification failed ({e.__class__.__name__}), retrying in {delay}s (attempt {attempt}/{max_attempts})")
+                time.sleep(delay)
+            else:
+                log.error(f"Notification failed after {max_attempts} attempts: {e}")
+        except Exception as e:
+            log.error(f"Notification failed: {e}")
+            return
 
 
 # ─── Permission Decision State ────────────────────────────────────────────────
@@ -124,6 +225,49 @@ pending_decisions = {}  # request_id -> threading.Event
 decision_results = {}   # request_id -> "approve" | "deny"
 decision_lock = threading.Lock()
 request_counter = 0
+
+# ─── Plan Accept State ───────────────────────────────────────────────────────
+# When Claude exits plan mode, we store the terminal PID so the phone can
+# send an Enter keystroke to accept the plan.
+
+_plan_accept_lock = threading.Lock()
+_plan_accept_terminal_pid = None
+_plan_accept_timestamp = 0.0
+_PLAN_ACCEPT_STALENESS = 300  # seconds
+
+
+def _send_enter_to_terminal(terminal_pid):
+    """Send an Enter keystroke to the terminal window via PowerShell SendKeys.
+
+    Uses WScript.Shell COM object to activate the window by PID and send Enter.
+    Windows-only; returns False on other platforms or on failure.
+    """
+    if not IS_WINDOWS:
+        return False
+
+    ps_script = (
+        "$wsh = New-Object -ComObject WScript.Shell; "
+        f"$wsh.AppActivate({terminal_pid}); "
+        "Start-Sleep -Milliseconds 100; "
+        "$wsh.SendKeys('{ENTER}')"
+    )
+
+    try:
+        CREATE_NO_WINDOW = 0x08000000
+        result = subprocess.run(
+            ["powershell", "-NoProfile", "-Command", ps_script],
+            capture_output=True, text=True, timeout=5,
+            creationflags=CREATE_NO_WINDOW,
+        )
+        if result.returncode == 0:
+            log.info(f"Sent Enter to terminal PID {terminal_pid}")
+            return True
+        else:
+            log.warning(f"SendKeys failed: {result.stderr.strip()}")
+            return False
+    except Exception as e:
+        log.error(f"Failed to send Enter: {e}")
+        return False
 
 
 def create_pending_decision() -> str:
@@ -309,12 +453,188 @@ def _format_tool_preview(tool: str, tool_input) -> str:
     return f"```\n{s[:500]}\n```" if len(s) > 500 else f"```\n{s}\n```"
 
 
+# ─── Transcript Context Extraction ────────────────────────────────────────────
+
+def _read_file_tail(filepath, max_bytes=65536):
+    """Read the last max_bytes of a file, skipping any partial first line."""
+    try:
+        size = os.path.getsize(filepath)
+        with open(filepath, "r", encoding="utf-8", errors="replace") as f:
+            if size > max_bytes:
+                f.seek(size - max_bytes)
+                f.readline()  # skip partial first line
+            return f.read()
+    except (OSError, IOError):
+        return ""
+
+
+def _truncate(text, max_len=300):
+    """Truncate text with ellipsis."""
+    if len(text) <= max_len:
+        return text
+    return text[:max_len - 1] + "\u2026"
+
+
+def _format_ask_question(ask_input):
+    """Format an AskUserQuestion tool input for mobile notification.
+
+    Returns (title, body) or (None, None) if input is empty.
+    """
+    questions = ask_input.get("questions", [])
+    if not questions:
+        return None, None
+
+    q = questions[0]
+    header = q.get("header", "")
+    question_text = q.get("question", "")
+    options = q.get("options", [])
+
+    lines = []
+    if question_text:
+        lines.append(question_text)
+    for opt in options:
+        label = opt.get("label", "")
+        desc = opt.get("description", "")
+        if desc:
+            lines.append(f"- **{label}**: {desc}")
+        else:
+            lines.append(f"- {label}")
+
+    title = f"Claude asks: {header}" if header else "Claude asks a question"
+    body = "\n".join(lines)
+    return title, body
+
+
+def _extract_context_summary(transcript_path, notification_type):
+    """Extract context from the transcript for a richer notification.
+
+    Returns dict with 'title', 'message', 'tags', 'priority' keys,
+    or empty dict if no context found.
+    """
+    tail = _read_file_tail(transcript_path)
+    if not tail:
+        return {}
+
+    lines = tail.strip().split("\n")
+
+    ask_question = None
+    tool_call = None
+    assistant_text = None
+    exit_plan = False
+
+    for line in reversed(lines):
+        try:
+            entry = json.loads(line)
+        except (json.JSONDecodeError, ValueError):
+            continue
+
+        if entry.get("type") not in ("assistant", "progress"):
+            continue
+
+        message = entry.get("message", {})
+        content = message.get("content", [])
+        if not isinstance(content, list):
+            continue
+
+        for block in reversed(content):
+            if not isinstance(block, dict):
+                continue
+
+            if (block.get("type") == "tool_use"
+                    and block.get("name") == "AskUserQuestion"
+                    and ask_question is None):
+                ask_question = block.get("input", {})
+
+            elif (block.get("type") == "tool_use"
+                    and block.get("name") == "ExitPlanMode"):
+                exit_plan = True
+
+            elif (block.get("type") == "tool_use"
+                    and tool_call is None):
+                tool_call = {
+                    "name": block.get("name", ""),
+                    "input": block.get("input", {}),
+                }
+
+            elif block.get("type") == "text" and assistant_text is None:
+                text = block.get("text", "").strip()
+                if text:
+                    assistant_text = text
+
+        # Stop after first entry with useful content
+        if ask_question or tool_call or assistant_text or exit_plan:
+            break
+
+    return _format_context(notification_type, ask_question, tool_call, assistant_text, exit_plan)
+
+
+def _format_context(notification_type, ask_question, tool_call, assistant_text, exit_plan=False):
+    """Route to the appropriate formatter based on notification type and context."""
+    if exit_plan:
+        return {
+            "title": "Claude has a plan",
+            "message": _truncate(assistant_text or "Plan ready for review.", 500),
+            "tags": "clipboard",
+            "priority": "high",
+            "is_plan_approval": True,
+        }
+
+    if notification_type == "elicitation_dialog" and ask_question:
+        title, body = _format_ask_question(ask_question)
+        if title:
+            return {
+                "title": title,
+                "message": _truncate(body, 500),
+                "tags": "question",
+                "priority": "high",
+            }
+
+    if notification_type == "idle_prompt" and assistant_text:
+        return {
+            "title": "Claude is waiting",
+            "message": _truncate(assistant_text, 300),
+            "tags": "hourglass",
+            "priority": "default",
+        }
+
+    # For any notification type, try to show something useful as fallback
+    if ask_question:
+        title, body = _format_ask_question(ask_question)
+        if title:
+            return {
+                "title": title,
+                "message": _truncate(body, 500),
+                "tags": "question",
+                "priority": "high",
+            }
+
+    if assistant_text:
+        return {
+            "title": "Claude needs attention",
+            "message": _truncate(assistant_text, 300),
+            "tags": "speech_balloon",
+            "priority": "default",
+        }
+
+    if tool_call:
+        name = tool_call.get("name", "unknown")
+        return {
+            "title": f"Claude is using {name}",
+            "message": _truncate(str(tool_call.get("input", "")), 200),
+            "tags": "speech_balloon",
+            "priority": "default",
+        }
+
+    return {}
+
+
 # ─── HTTP Server ──────────────────────────────────────────────────────────────
 
 class ActionHandler(BaseHTTPRequestHandler):
     base_url = ""
 
     def do_POST(self):
+        global _plan_accept_terminal_pid, _plan_accept_timestamp
         path = urlparse(self.path).path
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length).decode() if content_length else ""
@@ -325,20 +645,43 @@ class ActionHandler(BaseHTTPRequestHandler):
             data = json.loads(body) if body else {}
             ntype = data.get("notification_type", "")
             message = data.get("message", "")
+            context = data.get("context_summary", {})
 
-            # Pick tag/priority based on notification type
-            if ntype == "permission_prompt":
-                tags, priority = "bell", "high"
-            elif ntype == "idle_prompt":
-                tags, priority = "hourglass", "default"
+            if context:
+                # Use enriched context from transcript
+                title = context.get("title", data.get("title", "Claude Code"))
+                message = context.get("message", message)
+                tags = context.get("tags", "speech_balloon")
+                priority = context.get("priority", "default")
             else:
-                tags, priority = "speech_balloon", "default"
+                # Fallback to generic message
+                title = data.get("title", "Claude Code")
+                if ntype == "permission_prompt":
+                    tags, priority = "bell", "high"
+                elif ntype == "idle_prompt":
+                    tags, priority = "hourglass", "default"
+                else:
+                    tags, priority = "speech_balloon", "default"
+
+            actions = None
+
+            # Plan approval: store terminal PID and add Accept button
+            if context.get("is_plan_approval"):
+                terminal_pid = data.get("terminal_pid")
+                if terminal_pid:
+                    with _plan_accept_lock:
+                        _plan_accept_terminal_pid = terminal_pid
+                        _plan_accept_timestamp = time.time()
+                    actions = [
+                        {"label": "Accept Plan", "url": f"{self.base_url}/plan/accept", "method": "POST"},
+                    ]
 
             send_notification(
-                title=data.get("title", "Claude Code"),
+                title=title,
                 message=message,
                 priority=priority,
                 tags=tags,
+                actions=actions,
             )
             self._respond(200, "{}")
 
@@ -387,6 +730,25 @@ class ActionHandler(BaseHTTPRequestHandler):
 
         # ── Phone action endpoints (called by ntfy action buttons) ────────
 
+        elif path == "/plan/accept":
+            with _plan_accept_lock:
+                terminal_pid = _plan_accept_terminal_pid
+                timestamp = _plan_accept_timestamp
+                _plan_accept_terminal_pid = None  # one-shot: clear immediately
+
+            if not terminal_pid:
+                self._respond(200, "\u26a0\ufe0f No pending plan to accept")
+                return
+
+            if time.time() - timestamp > _PLAN_ACCEPT_STALENESS:
+                self._respond(200, "\u23f0 Plan accept expired (>5 min)")
+                return
+
+            if _send_enter_to_terminal(terminal_pid):
+                self._respond(200, "\u2705 Plan accepted!")
+            else:
+                self._respond(200, "\u274c Failed to send Enter to terminal")
+
         elif path.startswith("/decide/"):
             parts = path.split("/")
             # /decide/{rid}/{decision}
@@ -427,6 +789,50 @@ class ActionHandler(BaseHTTPRequestHandler):
 # When called with --hook, this script acts as the hook handler.
 # It reads JSON from stdin, POSTs to the server, and returns the response.
 
+_LOCK_PATH = os.path.join(os.path.expanduser("~"), ".claude-ntfy-hook.lock")
+
+
+@contextlib.contextmanager
+def _startup_lock():
+    """Acquire an OS-level file lock to serialize server auto-start.
+
+    Yields True if the lock was acquired (caller should check & spawn),
+    or False if another process already holds it (caller should just wait).
+    The lock is released when the context exits.
+    """
+    fd = None
+    acquired = False
+    try:
+        fd = os.open(_LOCK_PATH, os.O_CREAT | os.O_RDWR)
+        if IS_WINDOWS:
+            import msvcrt
+            try:
+                msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+                acquired = True
+            except OSError:
+                acquired = False
+        else:
+            import fcntl
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+            except OSError:
+                acquired = False
+        yield acquired
+    finally:
+        if fd is not None:
+            if acquired:
+                if IS_WINDOWS:
+                    import msvcrt
+                    try:
+                        os.lseek(fd, 0, os.SEEK_SET)
+                        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+                    except OSError:
+                        pass
+                # fcntl locks auto-release on close
+            os.close(fd)
+
+
 def _server_is_running(server_url: str) -> bool:
     """Quick health check to see if the server is up."""
     try:
@@ -436,45 +842,56 @@ def _server_is_running(server_url: str) -> bool:
 
 
 def _auto_start_server(server_url: str):
-    """Spawn the server in the background if it's not already running."""
+    """Spawn the server in the background if it's not already running.
+
+    Uses an OS-level file lock to prevent multiple hook processes from
+    each spawning a server on cold start.
+    """
+    # Fast path — no lock needed if already running
     if _server_is_running(server_url):
         return
 
-    parsed = urlparse(server_url)
-    port = parsed.port or HTTP_PORT
+    with _startup_lock() as acquired:
+        if acquired:
+            # Re-check inside the lock (another process may have started it)
+            if _server_is_running(server_url):
+                return
 
-    topic = NTFY_TOPIC or _generate_topic()
-    script_path = os.path.abspath(__file__).replace("\\", "/")
-    log_file = os.path.join(os.path.expanduser("~"), ".claude-ntfy-hook.log")
-    cmd = [
-        sys.executable, script_path, "server",
-        "--port", str(port),
-        "--topic", topic,
-        "--ntfy-server", NTFY_SERVER,
-    ]
+            parsed = urlparse(server_url)
+            port = parsed.port or HTTP_PORT
 
-    # Spawn the server in its own visible terminal window
-    if IS_WINDOWS:
-        CREATE_NEW_CONSOLE = 0x00000010
-        subprocess.Popen(
-            cmd,
-            creationflags=CREATE_NEW_CONSOLE,
-        )
-    else:
-        subprocess.Popen(
-            cmd,
-            start_new_session=True,
-        )
+            topic = NTFY_TOPIC or _generate_topic()
+            script_path = os.path.abspath(__file__).replace("\\", "/")
+            log_file = os.path.join(os.path.expanduser("~"), ".claude-ntfy-hook.log")
+            cmd = [
+                sys.executable, script_path, "server",
+                "--port", str(port),
+                "--topic", topic,
+                "--ntfy-server", NTFY_SERVER,
+            ]
 
-    # Wait for it to come up
-    for _ in range(10):
-        time.sleep(0.5)
-        if _server_is_running(server_url):
-            msg = f"Auto-started server\n  topic: {topic}\n  log:   {log_file}"
-            print(msg, file=sys.stderr)
-            return
+            if IS_WINDOWS:
+                CREATE_NEW_CONSOLE = 0x00000010
+                subprocess.Popen(cmd, creationflags=CREATE_NEW_CONSOLE)
+            else:
+                subprocess.Popen(cmd, start_new_session=True)
 
-    print("Warning: server did not start in time", file=sys.stderr)
+            # Wait for it to come up
+            for _ in range(10):
+                time.sleep(0.5)
+                if _server_is_running(server_url):
+                    msg = f"Auto-started server\n  topic: {topic}\n  log:   {log_file}"
+                    print(msg, file=sys.stderr)
+                    return
+
+            print("Warning: server did not start in time", file=sys.stderr)
+        else:
+            # Another hook process is handling startup — just wait for the server
+            for _ in range(15):
+                time.sleep(0.5)
+                if _server_is_running(server_url):
+                    return
+            print("Warning: server did not start in time (waited for lock holder)", file=sys.stderr)
 
 
 def run_as_hook(hook_type: str, server_url: str):
@@ -483,6 +900,26 @@ def run_as_hook(hook_type: str, server_url: str):
 
     # Auto-start the server if it's not running
     _auto_start_server(server_url)
+
+    # Enrich notification data with transcript context
+    if hook_type == "notification":
+        transcript_path = input_data.get("transcript_path", "")
+        if transcript_path and os.path.isfile(transcript_path):
+            try:
+                context = _extract_context_summary(
+                    transcript_path,
+                    input_data.get("notification_type", ""),
+                )
+                if context:
+                    input_data["context_summary"] = context
+                    # For plan approvals, find the terminal PID so the server
+                    # can send Enter when the user taps Accept on their phone
+                    if context.get("is_plan_approval"):
+                        terminal_pid = _find_terminal_pid()
+                        if terminal_pid:
+                            input_data["terminal_pid"] = terminal_pid
+            except Exception:
+                pass  # Fall back to generic message
 
     # Only pre_tool_use needs to block waiting for phone response
     timeout = PERMISSION_TIMEOUT + 10 if hook_type == "pre_tool_use" else 15
@@ -596,7 +1033,12 @@ def run_server(args):
         tags="rocket",
     )
 
-    server = ThreadingHTTPServer(("0.0.0.0", args.port), ActionHandler)
+    try:
+        server = ThreadingHTTPServer(("0.0.0.0", args.port), ActionHandler)
+    except OSError as e:
+        log.warning(f"Cannot bind port {args.port}: {e} — another instance is likely running")
+        raise SystemExit(0)
+
     log.info(f"Listening on :{args.port} — Ctrl+C to stop")
 
     try:
