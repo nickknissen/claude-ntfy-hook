@@ -1,51 +1,55 @@
 # claude-ntfy-hook
 
-Push notifications for [Claude Code](https://docs.anthropic.com/en/docs/claude-code) on your phone via [ntfy](https://ntfy.sh), with interactive **Allow/Deny** buttons for tool approval over [Tailscale](https://tailscale.com).
+Approve or deny Claude Code tool calls from your phone.
 
-No PTY wrapping, no regex matching — uses Claude Code's native [hook system](https://docs.anthropic.com/en/docs/claude-code/hooks).
+Uses [ntfy](https://ntfy.sh) for push notifications and [Tailscale](https://tailscale.com) for secure callbacks — all wired up through Claude Code's native [hook system](https://docs.anthropic.com/en/docs/claude-code/hooks). No PTY wrapping, no regex matching.
 
 ```
-Claude Code ──hook──▶ claude-notify.py --hook ──▶ server ──▶ ntfy ──▶ Phone
-                                                    ▲                    │
-                                                    └──── Tailscale ─────┘
+Claude Code ──hook──> claude-notify.py --hook ──> server ──> ntfy ──> Phone
+                                                    ^                   |
+                                                    +--- Tailscale -----+
 ```
 
-## Features
+## What You Get
 
-- **Phone notifications** when Claude Code finishes, needs input, or requests tool permission
-- **Allow/Deny from your phone** — approve or block tool calls remotely via ntfy action buttons
-- **Reads your Claude Code permissions** — only prompts for tools in your `ask` list, auto-approves everything else
-- **Auto-starts the server** — the hook spawns the server in the background if it's not running
-- **Markdown-formatted** notifications with tool-specific previews (commands, file paths, diffs)
-- **Works on Windows, macOS, and Linux**
+- **Allow/Deny from your phone** — tap a button on a push notification to approve or block a tool call
+- **Smart filtering** — reads your Claude Code `ask`/`allow`/`deny` rules, only bothers you when it matters
+- **Zero setup server** — auto-starts in its own terminal window the first time a hook fires
+- **Rich notifications** — markdown-formatted previews of commands, file paths, and diffs
+- **Stop notifications** — get pinged when Claude finishes with a summary of what it said
+- **Cross-platform** — Windows, macOS, and Linux
 
 ## Prerequisites
 
-- [uv](https://docs.astral.sh/uv/) (Python package runner)
-- [Tailscale](https://tailscale.com) on both your machine and phone
-- [ntfy app](https://ntfy.sh) on your phone
+- [uv](https://docs.astral.sh/uv/) — runs the script with dependencies, no install needed
+- [Tailscale](https://tailscale.com) — on both your machine and phone
+- [ntfy](https://ntfy.sh) — app on your phone (free)
 
-## Quick Start
+## Setup
 
-### 1. Start the server
+### 1. Run the server once to get your config
 
 ```bash
 uv run claude-notify.py server
 ```
 
-The server will:
+This will:
 - Auto-detect your Tailscale IP
-- Generate a unique ntfy topic (based on your username and hostname)
-- Print the `settings.json` hook configuration to copy
-- Send a test notification to verify everything works
+- Generate a unique ntfy topic (`claude-ntfy-hook-<hash>`)
+- Print the exact `settings.json` hooks config to copy
+- Send a test notification to verify the connection
 
 ### 2. Subscribe on your phone
 
-Open the ntfy app and subscribe to the topic shown in the server output (e.g. `claude-ntfy-hook-a1b2c3d4e5f6`).
+Open the ntfy app and subscribe to the topic from the server output. You can always find it again:
+
+```bash
+cat ~/.claude-ntfy-hook-topic
+```
 
 ### 3. Add hooks to Claude Code
 
-Copy the hook configuration printed by the server into your `~/.claude/settings.json`. It will look like:
+Paste the config from step 1 into `~/.claude/settings.json`:
 
 ```json
 {
@@ -87,20 +91,19 @@ Copy the hook configuration printed by the server into your `~/.claude/settings.
 }
 ```
 
-### 4. Use Claude Code normally
+### 4. Done
 
-You'll receive notifications when:
+Use Claude Code normally. The server auto-starts when needed — you don't have to keep it running manually.
 
-| Event | Notification |
+| What happens | What you see on your phone |
 |---|---|
-| **Tool needs approval** | Urgent push with Allow/Deny buttons |
-| **Claude finishes** | Summary of Claude's last message |
-| **Permission prompt** | Claude is waiting for input |
-| **Idle** | Claude has been idle for 60+ seconds |
+| Claude wants to run `rm -rf /tmp/foo` | Push notification with **Allow** / **Deny** buttons |
+| Claude finishes a task | Summary of its last message |
+| Claude is waiting for input | Notification that it needs attention |
 
 ## Permission Integration
 
-The hook reads your `permissions` from `~/.claude/settings.json` and only sends phone notifications for tools matching your `ask` rules. Everything in `allow` is auto-approved silently, and `deny` is handled by Claude Code itself.
+The hook reads your `permissions` from `~/.claude/settings.json` and only sends phone prompts for tools in your `ask` list. Everything else is handled silently.
 
 ```json
 {
@@ -112,34 +115,34 @@ The hook reads your `permissions` from `~/.claude/settings.json` and only sends 
 }
 ```
 
-With this config:
-- `git status` → auto-approved, no notification
-- `rm -rf /tmp/foo` → phone notification with Allow/Deny
-- `git push origin main` → phone notification with Allow/Deny
+| Command | Result |
+|---|---|
+| `git status` | Auto-approved, no notification |
+| `rm -rf /tmp/foo` | Phone notification with Allow/Deny |
+| `git push origin main` | Phone notification with Allow/Deny |
+| `cat .env` | Blocked by Claude Code, hook never fires |
 
 ## Server Options
 
 ```
 uv run claude-notify.py server [OPTIONS]
 
-Options:
-  --topic TOPIC          ntfy topic (auto-generated if not provided)
+  --topic TOPIC          ntfy topic (auto-generated if omitted)
   --port PORT            HTTP port (default: 8787)
-  --ntfy-server URL      ntfy server URL (default: https://ntfy.sh)
-  --ts-ip IP             Tailscale IP override (auto-detected if not provided)
+  --ntfy-server URL      ntfy server (default: https://ntfy.sh)
+  --ts-ip IP             Override Tailscale IP auto-detection
 ```
 
 ## How It Works
 
-1. Claude Code fires a hook event (PreToolUse, Notification, or Stop)
-2. The hook script (`--hook` mode) reads the event JSON from stdin
-3. It checks if the server is running, auto-starts it if needed
-4. Posts the event to the server over Tailscale
-5. For `PreToolUse` with `ask` rules: server sends an ntfy notification with Allow/Deny action buttons, then blocks waiting for a response
-6. You tap Allow or Deny on your phone → ntfy posts back to the server over Tailscale
-7. Server unblocks and returns the decision to the hook script
-8. Hook exits with code 0 (allow) or code 2 (block)
+1. Claude Code fires a hook (PreToolUse, Notification, or Stop)
+2. The hook script checks if the server is running — auto-starts it if not
+3. Posts the event to the server over your Tailscale network
+4. For tools in your `ask` list: sends an ntfy push with Allow/Deny action buttons and blocks
+5. You tap a button on your phone — ntfy POSTs back to the server over Tailscale
+6. Server unblocks, hook exits with code 0 (allow) or 2 (block)
+7. Claude Code proceeds or stops accordingly
 
 ## License
 
-MIT
+[MIT](LICENSE)
