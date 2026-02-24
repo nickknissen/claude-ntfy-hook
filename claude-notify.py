@@ -235,11 +235,19 @@ _plan_accept_terminal_pid = None
 _plan_accept_timestamp = 0.0
 _PLAN_ACCEPT_STALENESS = 300  # seconds
 
+# ─── Question Answer State ────────────────────────────────────────────────────
+# When Claude asks a question, we store the terminal PID so the phone can
+# send arrow-key + Enter to select an option.
 
-def _send_enter_to_terminal(terminal_pid):
-    """Send an Enter keystroke to the terminal window via PowerShell SendKeys.
+_question_lock = threading.Lock()
+_question_terminal_pid = None
+_question_timestamp = 0.0
 
-    Uses WScript.Shell COM object to activate the window by PID and send Enter.
+
+def _send_keys_to_terminal(terminal_pid, keys="{ENTER}"):
+    """Send keystrokes to the terminal window via PowerShell SendKeys.
+
+    Uses WScript.Shell COM object to activate the window by PID and send keys.
     Windows-only; returns False on other platforms or on failure.
     """
     if not IS_WINDOWS:
@@ -249,7 +257,7 @@ def _send_enter_to_terminal(terminal_pid):
         "$wsh = New-Object -ComObject WScript.Shell; "
         f"$wsh.AppActivate({terminal_pid}); "
         "Start-Sleep -Milliseconds 100; "
-        "$wsh.SendKeys('{ENTER}')"
+        f"$wsh.SendKeys('{keys}')"
     )
 
     try:
@@ -260,13 +268,13 @@ def _send_enter_to_terminal(terminal_pid):
             creationflags=CREATE_NO_WINDOW,
         )
         if result.returncode == 0:
-            log.info(f"Sent Enter to terminal PID {terminal_pid}")
+            log.info(f"Sent keys to terminal PID {terminal_pid}: {keys}")
             return True
         else:
             log.warning(f"SendKeys failed: {result.stderr.strip()}")
             return False
     except Exception as e:
-        log.error(f"Failed to send Enter: {e}")
+        log.error(f"Failed to send keys: {e}")
         return False
 
 
@@ -582,11 +590,14 @@ def _format_context(notification_type, ask_question, tool_call, assistant_text, 
     if notification_type == "elicitation_dialog" and ask_question:
         title, body = _format_ask_question(ask_question)
         if title:
+            options = [opt.get("label", "") for opt in ask_question.get("questions", [{}])[0].get("options", [])]
             return {
                 "title": title,
                 "message": _truncate(body, 500),
                 "tags": "question",
                 "priority": "high",
+                "is_question": True,
+                "options": options,
             }
 
     if notification_type == "idle_prompt" and assistant_text:
@@ -601,11 +612,14 @@ def _format_context(notification_type, ask_question, tool_call, assistant_text, 
     if ask_question:
         title, body = _format_ask_question(ask_question)
         if title:
+            options = [opt.get("label", "") for opt in ask_question.get("questions", [{}])[0].get("options", [])]
             return {
                 "title": title,
                 "message": _truncate(body, 500),
                 "tags": "question",
                 "priority": "high",
+                "is_question": True,
+                "options": options,
             }
 
     if assistant_text:
@@ -635,6 +649,7 @@ class ActionHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         global _plan_accept_terminal_pid, _plan_accept_timestamp
+        global _question_terminal_pid, _question_timestamp
         path = urlparse(self.path).path
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length).decode() if content_length else ""
@@ -675,6 +690,22 @@ class ActionHandler(BaseHTTPRequestHandler):
                     actions = [
                         {"label": "Accept Plan", "url": f"{self.base_url}/plan/accept", "method": "POST"},
                     ]
+
+            # Question: store terminal PID and add option buttons
+            elif context.get("is_question"):
+                terminal_pid = data.get("terminal_pid")
+                options = context.get("options", [])
+                if terminal_pid and options:
+                    with _question_lock:
+                        _question_terminal_pid = terminal_pid
+                        _question_timestamp = time.time()
+                    actions = []
+                    for i, opt in enumerate(options[:3]):  # ntfy max 3 actions
+                        actions.append({
+                            "label": opt,
+                            "url": f"{self.base_url}/question/select/{i}",
+                            "method": "POST",
+                        })
 
             send_notification(
                 title=title,
@@ -744,10 +775,36 @@ class ActionHandler(BaseHTTPRequestHandler):
                 self._respond(200, "\u23f0 Plan accept expired (>5 min)")
                 return
 
-            if _send_enter_to_terminal(terminal_pid):
+            if _send_keys_to_terminal(terminal_pid):
                 self._respond(200, "\u2705 Plan accepted!")
             else:
                 self._respond(200, "\u274c Failed to send Enter to terminal")
+
+        elif path.startswith("/question/select/"):
+            try:
+                index = int(path.split("/")[-1])
+            except ValueError:
+                self._respond(400, "Bad request")
+                return
+
+            with _question_lock:
+                terminal_pid = _question_terminal_pid
+                timestamp = _question_timestamp
+                _question_terminal_pid = None  # one-shot: clear immediately
+
+            if not terminal_pid:
+                self._respond(200, "\u26a0\ufe0f No pending question")
+                return
+
+            if time.time() - timestamp > _PLAN_ACCEPT_STALENESS:
+                self._respond(200, "\u23f0 Question expired (>5 min)")
+                return
+
+            keys = "{DOWN}" * index + "{ENTER}"
+            if _send_keys_to_terminal(terminal_pid, keys):
+                self._respond(200, f"\u2705 Selected option {index + 1}")
+            else:
+                self._respond(200, "\u274c Failed to send selection")
 
         elif path.startswith("/decide/"):
             parts = path.split("/")
@@ -912,9 +969,9 @@ def run_as_hook(hook_type: str, server_url: str):
                 )
                 if context:
                     input_data["context_summary"] = context
-                    # For plan approvals, find the terminal PID so the server
-                    # can send Enter when the user taps Accept on their phone
-                    if context.get("is_plan_approval"):
+                    # For plan approvals and questions, find the terminal PID
+                    # so the server can send keystrokes from the phone
+                    if context.get("is_plan_approval") or context.get("is_question"):
                         terminal_pid = _find_terminal_pid()
                         if terminal_pid:
                             input_data["terminal_pid"] = terminal_pid
