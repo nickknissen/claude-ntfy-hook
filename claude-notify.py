@@ -32,6 +32,8 @@ import argparse
 import logging
 import threading
 import contextlib
+import copy
+import difflib
 from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
 import platform
@@ -132,6 +134,14 @@ HTTP_PORT = 8787
 TAILSCALE_IP = None  # Auto-detect if None
 PERMISSION_TIMEOUT = 300  # seconds to wait for remote allow/deny
 
+USER_CLAUDE_SETTINGS_PATH = os.path.expanduser("~/.claude/settings.json")
+PROJECT_CLAUDE_SETTINGS_PATH = os.path.join(".claude", "settings.json")
+MANAGED_HOOK_EVENTS = {
+    "Notification": "notification",
+    "PreToolUse": "pre_tool_use",
+    "Stop": "stop",
+}
+
 def _generate_topic() -> str:
     """Generate a unique topic based on machine username and hostname."""
     seed = f"{os.getenv('USERNAME', os.getenv('USER', 'unknown'))}@{platform.node()}"
@@ -172,7 +182,12 @@ def get_tailscale_ip():
 # ─── Notification ─────────────────────────────────────────────────────────────
 
 def send_notification(title, message, actions=None, priority="default", tags="", markdown=True):
-    headers = {"Title": title, "Priority": priority, "Tags": tags}
+    headers = {
+        "Title": title,
+        "Priority": priority,
+        "Tags": tags,
+        "Content-Type": "text/plain; charset=utf-8",
+    }
     if markdown:
         headers["Markdown"] = "yes"
     if actions:
@@ -314,13 +329,212 @@ def resolve_decision(rid: str, decision: str):
     log.info(f"Decision {rid}: {decision}")
 
 
+# ─── Settings Hook Management ────────────────────────────────────────────────
+
+def _script_path() -> str:
+    return os.path.abspath(__file__).replace("\\", "/")
+
+
+def _build_managed_hook_commands(server_url: str) -> dict[str, str]:
+    hook_cmd = f"uv run {_script_path()}"
+    return {
+        event: f"{hook_cmd} --hook {hook_type} --server {server_url}"
+        for event, hook_type in MANAGED_HOOK_EVENTS.items()
+    }
+
+
+def _build_hook_settings(server_url: str) -> dict:
+    return {
+        "hooks": {
+            event: [
+                {
+                    "matcher": "",
+                    "hooks": [
+                        {
+                            "type": "command",
+                            "command": command,
+                        }
+                    ],
+                }
+            ]
+            for event, command in _build_managed_hook_commands(server_url).items()
+        }
+    }
+
+
+def _load_settings_file(path: str) -> tuple[dict, str, bool]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            raw = f.read()
+    except FileNotFoundError:
+        return {}, "", False
+
+    if not raw.strip():
+        return {}, raw, True
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise SystemExit(f"Failed to parse JSON in {path}: {exc}")
+
+    if not isinstance(data, dict):
+        raise SystemExit(f"Expected top-level JSON object in {path}")
+
+    return data, raw, True
+
+
+def _remove_managed_hook_entries(settings: dict):
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        return
+
+    script_path = _script_path()
+    for event, hook_type in MANAGED_HOOK_EVENTS.items():
+        blocks = hooks.get(event)
+        if not isinstance(blocks, list):
+            continue
+
+        command_prefix = f"uv run {script_path} --hook {hook_type}"
+        kept_blocks = []
+
+        for block in blocks:
+            if not isinstance(block, dict):
+                kept_blocks.append(block)
+                continue
+
+            hook_list = block.get("hooks")
+            if not isinstance(hook_list, list):
+                kept_blocks.append(block)
+                continue
+
+            kept_hooks = []
+            removed = False
+            for hook in hook_list:
+                if (
+                    isinstance(hook, dict)
+                    and hook.get("type") == "command"
+                    and isinstance(hook.get("command"), str)
+                    and hook["command"].startswith(command_prefix)
+                ):
+                    removed = True
+                    continue
+                kept_hooks.append(hook)
+
+            if removed:
+                if kept_hooks:
+                    updated_block = dict(block)
+                    updated_block["hooks"] = kept_hooks
+                    kept_blocks.append(updated_block)
+                continue
+
+            kept_blocks.append(block)
+
+        if kept_blocks:
+            hooks[event] = kept_blocks
+        else:
+            hooks.pop(event, None)
+
+    if not hooks:
+        settings.pop("hooks", None)
+
+
+def _add_managed_hooks(settings: dict, server_url: str):
+    _remove_managed_hook_entries(settings)
+
+    hooks = settings.get("hooks")
+    if not isinstance(hooks, dict):
+        hooks = {}
+        settings["hooks"] = hooks
+
+    for event, command in _build_managed_hook_commands(server_url).items():
+        existing_blocks = hooks.get(event)
+        if not isinstance(existing_blocks, list):
+            existing_blocks = []
+        existing_blocks.append(
+            {
+                "matcher": "",
+                "hooks": [
+                    {
+                        "type": "command",
+                        "command": command,
+                    }
+                ],
+            }
+        )
+        hooks[event] = existing_blocks
+
+
+def _render_settings_json(settings: dict) -> str:
+    return json.dumps(settings, indent=2) + "\n"
+
+
+def _build_settings_diff(path: str, old_text: str, new_text: str) -> str:
+    return "".join(
+        difflib.unified_diff(
+            old_text.splitlines(keepends=True),
+            new_text.splitlines(keepends=True),
+            fromfile=f"{path} (current)",
+            tofile=f"{path} (proposed)",
+        )
+    )
+
+
+def run_hook_toggle(args):
+    settings_path = os.path.expanduser(args.settings_file)
+    current_settings, current_raw, exists = _load_settings_file(settings_path)
+
+    if args.toggle == "remove" and not exists:
+        print(f"No settings file found at {settings_path}; nothing to remove.")
+        return
+
+    updated_settings = copy.deepcopy(current_settings)
+    if args.toggle == "add":
+        server_url = args.server_url or f"http://{get_tailscale_ip()}:{HTTP_PORT}"
+        _add_managed_hooks(updated_settings, server_url)
+    else:
+        _remove_managed_hook_entries(updated_settings)
+
+    if updated_settings == current_settings:
+        print("No hook changes required.")
+        return
+
+    old_text = current_raw
+    if old_text and not old_text.endswith("\n"):
+        old_text += "\n"
+    new_text = _render_settings_json(updated_settings)
+
+    diff = _build_settings_diff(settings_path, old_text, new_text)
+    if diff:
+        print(diff, end="")
+    else:
+        print("(No textual diff)")
+
+    try:
+        confirm = input(f"Apply '{args.toggle}' hook changes to {settings_path}? [y/N]: ").strip().lower()
+    except EOFError:
+        print("Cancelled; no input available for confirmation.")
+        return
+    if confirm not in {"y", "yes"}:
+        print("Cancelled; no changes applied.")
+        return
+
+    settings_dir = os.path.dirname(settings_path)
+    if settings_dir:
+        os.makedirs(settings_dir, exist_ok=True)
+
+    with open(settings_path, "w", encoding="utf-8") as f:
+        f.write(new_text)
+
+    print(f"Updated {settings_path}")
+
+
 # ─── Permission Matching (reads from Claude Code settings.json) ──────────────
 
 def _load_permissions() -> dict:
     """Load permission rules from Claude Code settings.json."""
     paths = [
-        os.path.expanduser("~/.claude/settings.json"),
-        os.path.join(".claude", "settings.json"),
+        USER_CLAUDE_SETTINGS_PATH,
+        PROJECT_CLAUDE_SETTINGS_PATH,
     ]
     merged = {"allow": [], "ask": [], "deny": []}
     for p in paths:
@@ -1034,47 +1248,7 @@ def run_server(args):
     log.info("=" * 60)
 
     # Print the settings.json config for the user
-    # Forward slashes so uv/shell doesn't eat Windows backslashes
-    script_path = os.path.abspath(__file__).replace("\\", "/")
-    hook_cmd = f"uv run {script_path}"
-
-    settings = {
-        "hooks": {
-            "Notification": [
-                {
-                    "matcher": "",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": f"{hook_cmd} --hook notification --server {base_url}",
-                        }
-                    ],
-                }
-            ],
-            "PreToolUse": [
-                {
-                    "matcher": "",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": f"{hook_cmd} --hook pre_tool_use --server {base_url}",
-                        }
-                    ],
-                }
-            ],
-            "Stop": [
-                {
-                    "matcher": "",
-                    "hooks": [
-                        {
-                            "type": "command",
-                            "command": f"{hook_cmd} --hook stop --server {base_url}",
-                        }
-                    ],
-                }
-            ],
-        }
-    }
+    settings = _build_hook_settings(base_url)
 
     log.info("")
     log.info("Add this to your .claude/settings.json:")
@@ -1118,6 +1292,19 @@ def main():
     srv.add_argument("--ntfy-server", default=NTFY_SERVER, help="ntfy server URL")
     srv.add_argument("--ts-ip", default=None, help="Tailscale IP override")
 
+    # Settings toggle mode
+    hooks = sub.add_parser("hooks", help="Add or remove claude-notify hooks in settings.json")
+    hooks.add_argument("toggle", choices=["add", "remove"], help="Whether to add or remove managed hooks")
+    hooks.add_argument(
+        "--settings-file",
+        default=USER_CLAUDE_SETTINGS_PATH,
+        help=f"Path to Claude settings file (default: {USER_CLAUDE_SETTINGS_PATH})",
+    )
+    hooks.add_argument(
+        "--server-url",
+        default=None,
+        help="Server URL embedded in added hook commands (default: auto-detected Tailscale IP)",
+    )
     # Hook mode (called by Claude Code)
     parser.add_argument("--hook", choices=["notification", "pre_tool_use", "stop"],
                         help="Run as hook handler (called by Claude Code)")
@@ -1128,6 +1315,8 @@ def main():
 
     if args.hook:
         run_as_hook(args.hook, args.server)
+    elif args.mode == "hooks":
+        run_hook_toggle(args)
     elif args.mode == "server" or args.mode is None:
         # Default to server mode — fill in defaults when no subcommand given
         args.topic = getattr(args, "topic", None) or _generate_topic()
